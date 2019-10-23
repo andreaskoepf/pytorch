@@ -85,6 +85,9 @@ void nll_loss2d_forward_out_cpu_template(
         const scalar_t* weight_data =
             weight.defined() ? weight_contiguous.data_ptr<scalar_t>() : nullptr;
 
+        // we check target indicies but cannot throw inside parallel_for
+        std::atomic<int> invalid_target(-1);
+
         if (reduction == Reduction::None) {
           const int64_t batch_size = input.size(0);
           const int64_t H = input.size(2);
@@ -95,8 +98,6 @@ void nll_loss2d_forward_out_cpu_template(
           auto output_acc = output.accessor<scalar_t, 3>();
           auto target_acc = target.accessor<int64_t, 3>();
 
-          // we check target indicies but cannot throw inside parallel_for
-          std::atomic<int> invalid_target(-1);
           at::parallel_for(0, batch_size, 0, [&](int64_t start, int64_t end) {
             for (int64_t b = start; b < end; b++) {
               for (int64_t h = 0; h < H; h++) {
@@ -144,24 +145,60 @@ void nll_loss2d_forward_out_cpu_template(
         const int64_t map_size = input.size(2) * input.size(3);
         const int64_t sample_size = map_size * n_classes;
 
-        scalar_t total_weight_val = 0;
-        scalar_t output_val = 0;
-        for (int64_t b = 0; b < batch_size; b++) {
-          for (int64_t elem = 0; elem < map_size; elem++) {
-            const int64_t cur_target = target_data[b * map_size + elem];
-            if (cur_target == ignore_index) {
-              continue;
-            }
+        const int64_t grain_size =
+            std::max({1L,
+                      at::internal::GRAIN_SIZE / map_size,
+                      batch_size / get_num_threads()});
+        auto result = at::parallel_reduce(
+            0,
+            batch_size,
+            grain_size,
+            std::make_tuple<scalar_t, scalar_t>(0, 0),
+            [&](int64_t partial_begin,
+                int64_t partial_end,
+                std::tuple<scalar_t, scalar_t> identifiy) {
+              scalar_t total_weight_val = 0;
+              scalar_t output_val = 0;
 
-            TORCH_CHECK(cur_target >= 0 && cur_target < n_classes);
-            const scalar_t weight_val = weight_data ? weight_data[cur_target]
-                                                    : static_cast<scalar_t>(1);
-            total_weight_val += weight_val;
-            output_val -=
-                input_data[b * sample_size + cur_target * map_size + elem] *
-                weight_val;
-          }
-        }
+              for (int64_t b = partial_begin; b < partial_end; b++) {
+                for (int64_t elem = 0; elem < map_size; elem++) {
+                  const int64_t cur_target = target_data[b * map_size + elem];
+                  if (cur_target == ignore_index) {
+                    continue;
+                  }
+
+                  if (cur_target >= 0 && cur_target < n_classes) {
+                    const scalar_t weight_val = weight_data
+                        ? weight_data[cur_target]
+                        : static_cast<scalar_t>(1);
+                    total_weight_val += weight_val;
+                    output_val -=
+                        input_data
+                            [b * sample_size + cur_target * map_size + elem] *
+                        weight_val;
+                  } else {
+                    int tmp = -1;
+                    invalid_target.compare_exchange_strong(tmp, cur_target);
+                  }
+                }
+              }
+              return std::make_tuple(output_val, total_weight_val);
+            },
+            [](const std::tuple<scalar_t, scalar_t>& a,
+               const std::tuple<scalar_t, scalar_t>& b) {
+              return std::make_tuple(
+                  std::get<0>(a) + std::get<0>(b),
+                  std::get<1>(a) + std::get<1>(b));
+            });
+
+        TORCH_CHECK(
+            invalid_target.load() < 0,
+            "Target ",
+            invalid_target.load(),
+            " out of bounds.");
+
+        scalar_t output_val = std::get<0>(result);
+        const scalar_t total_weight_val = std::get<1>(result);
 
         if (reduction == Reduction::Mean &&
             (total_weight_val != 0 || input.numel() == 0)) {
@@ -172,7 +209,7 @@ void nll_loss2d_forward_out_cpu_template(
         *total_weight.data_ptr<scalar_t>() = total_weight_val;
         *output.data_ptr<scalar_t>() = output_val;
       });
-}
+} // namespace
 
 void nll_loss2d_backward_out_cpu_template(
     Tensor& grad_input,
@@ -184,7 +221,7 @@ void nll_loss2d_backward_out_cpu_template(
     int64_t ignore_index,
     const Tensor& total_weight) {
   check_inputs_nll_loss2d(input, target, weight);
-  
+
   grad_input.resize_as_(input);
   grad_input.zero_();
 
@@ -201,7 +238,7 @@ void nll_loss2d_backward_out_cpu_template(
 
         if (reduction == at::Reduction::None) {
           check_gradout_shape_nll_loss2d(grad_output, target);
-  
+
           const int64_t batch_size = input.size(0);
           const int64_t H = input.size(2);
           const int64_t W = input.size(3);
@@ -246,7 +283,7 @@ void nll_loss2d_backward_out_cpu_template(
 
         const auto target_contiguous = target.contiguous();
         const int64_t* target_data = target_contiguous.data_ptr<int64_t>();
-        
+
         scalar_t* grad_input_data = grad_input.data_ptr<scalar_t>();
 
         const int64_t batch_size = input.size(0);
@@ -254,8 +291,9 @@ void nll_loss2d_backward_out_cpu_template(
         const int64_t map_size = input.size(2) * input.size(3);
         const int64_t sample_size = map_size * n_classes;
 
-        scalar_t normalize =
-            (reduction == at::Reduction::Mean) ? total_weight_value : static_cast<scalar_t>(1);
+        scalar_t normalize = (reduction == at::Reduction::Mean)
+            ? total_weight_value
+            : static_cast<scalar_t>(1);
 
         at::parallel_for(0, batch_size, 0, [&](int64_t start, int64_t end) {
           for (int64_t b = start; b < end; b++) {
@@ -267,10 +305,12 @@ void nll_loss2d_backward_out_cpu_template(
 
               TORCH_CHECK(cur_target >= 0 && cur_target < n_classes);
 
-              const int64_t index = b * sample_size + cur_target * map_size + elem;
-              const scalar_t w = weight_data != nullptr ? weight_data[cur_target] : static_cast<scalar_t>(1);
-              grad_input_data[index] =
-                  -w / normalize * grad_output_value;
+              const int64_t index =
+                  b * sample_size + cur_target * map_size + elem;
+              const scalar_t w = weight_data != nullptr
+                  ? weight_data[cur_target]
+                  : static_cast<scalar_t>(1);
+              grad_input_data[index] = -w / normalize * grad_output_value;
             }
           }
         });
